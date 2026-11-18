@@ -4,3 +4,4 @@ test-out.txt
 .DS_Store
 Thumbs.db
 st.txt
+.tmp-audit-wire-*/

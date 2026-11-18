@@ -41,15 +41,18 @@ function keepValue(key: string): boolean {
 /**
  * Recursively count (and optionally mask) secret matches in string values.
  * Skips match-anchors and path-like keys (paths are policy-checked, not rewritten).
+ * When `cats` is given, the matched categories are collected into it.
  */
-function deepRedact(value: unknown, patterns: readonly Pattern[], mutate: boolean, skipKey?: string, opts?: ScanOptions): number {
+function deepRedact(value: unknown, patterns: readonly Pattern[], mutate: boolean, skipKey?: string, opts?: ScanOptions, cats?: Set<string>): number {
   if (typeof value === "string") {
     if (skipKey && keepValue(skipKey)) return 0
-    return redact(value, patterns, opts).matches.length
+    const r = redact(value, patterns, opts)
+    for (const m of r.matches) cats?.add(m.category)
+    return r.matches.length
   }
   if (Array.isArray(value)) {
     let n = 0
-    for (let i = 0; i < value.length; i++) n += deepRedact(value[i], patterns, mutate, undefined, opts)
+    for (let i = 0; i < value.length; i++) n += deepRedact(value[i], patterns, mutate, undefined, opts, cats)
     return n
   }
   if (isRecord(value)) {
@@ -60,11 +63,89 @@ function deepRedact(value: unknown, patterns: readonly Pattern[], mutate: boolea
           const r = redact(v, patterns, opts)
           if (r.matches.length > 0) {
             if (mutate) value[k] = r.text
+            for (const m of r.matches) cats?.add(m.category)
             n += r.matches.length
           }
         }
       } else {
-        n += deepRedact(v, patterns, mutate, k, opts)
+        n += deepRedact(v, patterns, mutate, k, opts, cats)
+      }
+    }
+    return n
+  }
+  return 0
+}
+
+/**
+ * GUARD-9 second pass: literal replacement of remembered secret values.
+ * Patterns cannot see a bare value without its `key=` context, nor a request
+ * body serialized from a copy taken before the admission-path mask — but a
+ * literal value match covers both. Runs on the parsed body, so provider-side
+ * `\uXXXX` escapes are already decoded; the JSON-escaped form (JSON inside a
+ * JSON string) is matched separately. The replacement is always the full
+ * `<REDACTED:category>` mask: the wire is the last resort and must not
+ * reproduce even a keepLast fragment.
+ */
+function wireValueForms(entries: readonly RememberedValue[]): { form: string; category: string }[] {
+  const out: { form: string; category: string }[] = []
+  for (const e of entries) {
+    out.push({ form: e.value, category: e.category })
+    const esc = JSON.stringify(e.value).slice(1, -1)
+    if (esc !== e.value) out.push({ form: esc, category: e.category })
+  }
+  return out
+}
+
+function scrubRemembered(s: string, forms: readonly { form: string; category: string }[], mutate: boolean, cats: Set<string>): { text: string; n: number } {
+  let out = s
+  let n = 0
+  for (const f of forms) {
+    const mask = `<REDACTED:${f.category}>`
+    let idx = out.indexOf(f.form)
+    while (idx !== -1) {
+      cats.add(f.category)
+      n++
+      if (mutate) {
+        out = out.slice(0, idx) + mask + out.slice(idx + f.form.length)
+        idx = out.indexOf(f.form, idx + mask.length)
+      } else {
+        idx = out.indexOf(f.form, idx + f.form.length)
+      }
+    }
+  }
+  return { text: out, n }
+}
+
+/** Recursively scrub string values of a parsed body by remembered values. */
+function deepScrubValues(value: unknown, forms: readonly { form: string; category: string }[], mutate: boolean, cats: Set<string>): number {
+  if (forms.length === 0) return 0
+  if (Array.isArray(value)) {
+    let n = 0
+    for (let i = 0; i < value.length; i++) {
+      const v = value[i]
+      if (typeof v === "string") {
+        const r = scrubRemembered(v, forms, mutate, cats)
+        if (r.n > 0) {
+          n += r.n
+          if (mutate) value[i] = r.text
+        }
+      } else if (v && typeof v === "object") {
+        n += deepScrubValues(v, forms, mutate, cats)
+      }
+    }
+    return n
+  }
+  if (isRecord(value)) {
+    let n = 0
+    for (const [k, v] of Object.entries(value)) {
+      if (typeof v === "string") {
+        const r = scrubRemembered(v, forms, mutate, cats)
+        if (r.n > 0) {
+          n += r.n
+          if (mutate) value[k] = r.text
+        }
+      } else if (v && typeof v === "object") {
+        n += deepScrubValues(v, forms, mutate, cats)
       }
     }
     return n
@@ -140,6 +221,74 @@ const tracked: { dispose(): Promise<void> }[] = []
 /** recent deps-audit dedup: tool.before and shell.create.before both see the same command */
 const DEPS_AUDIT_TTL_MS = 2000
 const depsAuditRecent = new Map<string, number>()
+
+/**
+ * GUARD-9 (docs/guard-9-investigation.md): values the guard has already masked
+ * on admission paths (prompt, context, tool results) can still reach the
+ * provider request — as an in-memory copy serialized before the mask was
+ * applied (2026-11-17 incident: the persisted message was masked from creation,
+ * yet the model echoed the raw key), or in a form the patterns do not
+ * recognize (a bare key on its own line, reproduced on v2.2.5). The wire layer
+ * keeps those raw values per session and scrubs the request body by literal
+ * value, independent of any pattern. In-memory only, TTL-bounded; the values
+ * are never persisted or logged — the audit records categories and counts.
+ */
+const REMEMBER_TTL_MS = 6 * 60 * 60 * 1000
+const REMEMBER_MAX_PER_SESSION = 64
+const REMEMBER_MIN_LEN = 8
+const REMEMBER_MAX_LEN = 4096
+const REMEMBER_MAX_SESSIONS = 128
+interface RememberedValue {
+  value: string
+  category: string
+  ts: number
+}
+const rememberedValues = new Map<string, RememberedValue[]>()
+
+function rememberValues(sessionID: string | undefined, matches: readonly { raw: string; category: string }[]): void {
+  if (!sessionID || matches.length === 0) return
+  const now = Date.now()
+  let list = rememberedValues.get(sessionID)
+  if (!list) {
+    // opportunistic sweep of dead sessions; bounded memory, no timers
+    if (rememberedValues.size >= REMEMBER_MAX_SESSIONS) {
+      for (const [sid, l] of rememberedValues) {
+        if (l.every((x) => now - x.ts >= REMEMBER_TTL_MS)) rememberedValues.delete(sid)
+      }
+      if (rememberedValues.size >= REMEMBER_MAX_SESSIONS) rememberedValues.delete(rememberedValues.keys().next().value as string)
+    }
+    list = []
+    rememberedValues.set(sessionID, list)
+  }
+  for (const m of matches) {
+    // wire scrub targets secrets; PII masks (emails, names) are a privacy
+    // concern, not exfiltration — remembering them only widens the
+    // false-positive surface on the wire
+    if (m.category.startsWith("pii")) continue
+    if (m.raw.length < REMEMBER_MIN_LEN || m.raw.length > REMEMBER_MAX_LEN) continue
+    const seen = list.find((x) => x.value === m.raw)
+    if (seen) {
+      seen.ts = now
+      continue
+    }
+    list.push({ value: m.raw, category: m.category, ts: now })
+  }
+  while (list.length > REMEMBER_MAX_PER_SESSION) list.shift()
+}
+
+function rememberedFor(sessionID: string | undefined): RememberedValue[] {
+  if (!sessionID) return []
+  const list = rememberedValues.get(sessionID)
+  if (!list) return []
+  const now = Date.now()
+  const fresh = list.filter((x) => now - x.ts < REMEMBER_TTL_MS)
+  if (fresh.length === 0) {
+    rememberedValues.delete(sessionID)
+    return []
+  }
+  if (fresh.length !== list.length) rememberedValues.set(sessionID, fresh)
+  return fresh
+}
 
 /** post-audit: give the install ~60s to finish, then npm audit in the project dir (warn-only) */
 const POST_AUDIT_DELAY_MS = 60_000
@@ -381,6 +530,9 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
         const text = event.prompt.text
         if (!text) return
         const r = redact(text, patterns, scanOpts)
+        // GUARD-9: keep the raw values so the wire layer can scrub copies that
+        // bypassed this mutation (see the registry comment above)
+        rememberValues(event.sessionID, r.matches)
         if (r.matches.length === 0) return
         if (mutate) {
           event.prompt.text = r.text
@@ -488,6 +640,7 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
         if (typeof msg === "string") {
           const r = redact(msg, patterns, scanOpts)
           if (r.matches.length > 0) {
+            rememberValues(event.sessionID, r.matches)
             if (mutate) event.error = new ToolError({ message: r.text })
             audit(cfg, { ts: now(), kind: "tool.after", tool: event.tool, sessionID: event.sessionID, categories: categoriesOf(r.matches), count: r.matches.length, action: mutate ? "redacted" : "warn" })
           }
@@ -502,6 +655,7 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
       const scrubText = (s: string): string => {
         const r = redact(s, patterns, scanOpts)
         if (r.matches.length > 0) {
+          rememberValues(event.sessionID, r.matches)
           n += r.matches.length
           for (const m of r.matches) cats.add(m.category)
           return mutate ? r.text : s
@@ -566,6 +720,9 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
       if (!cfg.redactOnWrite) return
       const r = redact(event.command, patterns, scanOpts)
       if (r.matches.length > 0) {
+        // ShellCreateBefore carries no sessionID (shell can be created outside
+        // a session) — remember only when one is present
+        rememberValues((event as { sessionID?: string }).sessionID, r.matches)
         if (mutate) event.command = r.text
         audit(cfg, { ts: now(), kind: "shell", categories: categoriesOf(r.matches), count: r.matches.length, action: mutate ? "redacted" : "warn" })
       }
@@ -584,11 +741,13 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
     trackHook(
       ctx.session.hook("context", (event) => {
         const mutate = cfg.mode === "enforce"
+        const sid = (event as { sessionID?: string }).sessionID
         let n = 0
         const cats = new Set<string>()
         const scrub = (s: string): string => {
           const r = redact(s, patterns, scanOpts)
           if (r.matches.length > 0) {
+            rememberValues(sid, r.matches)
             n += r.matches.length
             for (const m of r.matches) cats.add(m.category)
             return mutate ? r.text : s
@@ -612,6 +771,62 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
           }
         }
         if (n > 0) audit(cfg, { ts: now(), kind: "context", categories: [...cats].sort(), count: n, action: mutate ? "redacted" : "warn" })
+      }),
+    )
+  }
+
+  // --- wire-level scrub (last resort) ---
+  // GUARD-9 incident signature (2026-11-17, see docs/guard-9-investigation.md):
+  // the provider received a raw credential while the prompt hook audited
+  // "redacted" and the persisted message was masked — the model request was
+  // built from an in-memory copy that carried the raw text, a copy neither the
+  // prompt mutation nor the context scrub ever saw. The exact runtime trigger
+  // could not be reproduced on v2.2.5 (direct prompt, queue-into-busy-loop and
+  // resume-with-history were all tested clean with the same code and config),
+  // so this hook treats the gap as structural: scrubbing the actual
+  // provider request body covers every admission path and transport, whoever
+  // built the copy. Audit tag for this layer: detail "wire".
+  if (cfg.scanOutbound) {
+    const MAX_WIRE_BYTES = 8 * 1024 * 1024
+    trackHook(
+      ctx.session.hook("http.request", async (event) => {
+        try {
+          const req = event.request
+          const ct = (req.headers.get("content-type") ?? "").toLowerCase()
+          if (!ct.includes("application/json")) return
+          const method = req.method.toUpperCase()
+          if (method !== "POST" && method !== "PUT" && method !== "PATCH") return
+          // read a clone: the original request body must stay usable when we
+          // decide not to rewrite (warn mode / no matches)
+          const text = await req.clone().text()
+          if (!text) return
+          if (Buffer.byteLength(text, "utf8") > MAX_WIRE_BYTES) {
+            audit(cfg, { ts: now(), kind: "context", sessionID: event.sessionID, categories: ["wire-skipped"], count: 1, action: "warn", detail: "provider request body too large to scrub" })
+            return
+          }
+          let parsed: unknown
+          try {
+            parsed = JSON.parse(text)
+          } catch {
+            return
+          }
+          const mutate = cfg.mode === "enforce"
+          const cats = new Set<string>()
+          const n = deepRedact(parsed, patterns, mutate, undefined, scanOpts, cats)
+          // GUARD-9 second pass: patterns cannot see a bare value without its
+          // `key=` context, nor a body serialized from a copy taken before the
+          // admission-path mask. Values the guard masked anywhere in this
+          // session are replaced literally (see the registry comment).
+          const vn = deepScrubValues(parsed, wireValueForms(rememberedFor(event.sessionID)), mutate, cats)
+          if (n + vn === 0 || !mutate) return
+          const newText = JSON.stringify(parsed)
+          const headers = new Headers(req.headers)
+          headers.set("content-length", String(Buffer.byteLength(newText, "utf8")))
+          event.request = new Request(req.url, { method: req.method, headers, body: newText })
+          audit(cfg, { ts: now(), kind: "context", sessionID: event.sessionID, categories: [...cats].sort(), count: n + vn, action: "redacted", detail: "wire" })
+        } catch {
+          // never break the provider request
+        }
       }),
     )
   }
