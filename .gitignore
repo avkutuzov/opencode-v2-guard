@@ -5,3 +5,4 @@ test-out.txt
 Thumbs.db
 st.txt
 .tmp-audit-wire-*/
+.tmp-audit-ctx-*/

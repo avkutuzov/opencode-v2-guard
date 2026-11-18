@@ -104,6 +104,8 @@ Since v1.2.2 the guard closes this class with two layers on `session.http.reques
 1. **Pattern scrub** — the actual provider request body is deep-redacted by the same patterns as the admission paths.
 2. **Remembered-value scrub** — every admission hook (prompt, context, tool results, shell) remembers the raw values it has masked (per-session, in-memory, TTL 6h, cap 64 values/session; never persisted, never logged — audit records categories and counts only). The wire hook then replaces those values **literally**, independent of any pattern: bare occurrences, pre-mask copies, and JSON-escaped forms inside nested JSON strings. Whatever copy the request was built from, if the guard ever masked that value in the session, it cannot reach the provider.
 
+Since v1.2.3 the outbound **context scrub is the universal content interceptor**: it masks secrets in every message part that carries text — `text`, assistant `reasoning` (replayed to thinking-capable providers), and the raw instruction copies in system `metadata.experimental.instructions` — plus literal value-scrub of remembered values, so DB-restored history with bare occurrences is masked at context-build time, before the wire.
+
 > ⚠ **v1.2.1 and earlier are NOT reliable protection against this class** — patterns miss context-free values, and nothing scans the actual provider request. Update to ≥1.2.2.
 
 ## Known limitations
@@ -120,7 +122,7 @@ Since v1.2.2 the guard closes this class with two layers on `session.http.reques
 
 ```bash
 npm install
-npm test          # node --test (183 tests)
+npm test          # node --test (186 tests)
 npm run typecheck # tsc --noEmit
 ```
 

@@ -744,19 +744,37 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
         const sid = (event as { sessionID?: string }).sessionID
         let n = 0
         const cats = new Set<string>()
+        // values masked earlier in this session (prompt/tool/wire) are
+        // scrubbed literally here too: DB-restored messages can carry bare
+        // occurrences that patterns cannot see
+        const forms = wireValueForms(rememberedFor(sid))
         const scrub = (s: string): string => {
-          const r = redact(s, patterns, scanOpts)
+          let out = s
+          const r = redact(out, patterns, scanOpts)
           if (r.matches.length > 0) {
             rememberValues(sid, r.matches)
             n += r.matches.length
             for (const m of r.matches) cats.add(m.category)
-            return mutate ? r.text : s
+            out = mutate ? r.text : s
           }
-          return s
+          if (forms.length > 0) {
+            const v = scrubRemembered(out, forms, mutate, cats)
+            n += v.n
+            return mutate ? v.text : out
+          }
+          return out
         }
-        const system = event.system as Array<{ type: string; text?: string }>
+        const system = event.system as Array<{ type: string; text?: string; metadata?: { experimental?: { instructions?: { key: string; text: string }[] } } }>
         for (const part of system) {
-          if (part.type === "text" && typeof part.text === "string") part.text = scrub(part.text)
+          if (typeof part.text === "string") part.text = scrub(part.text)
+          // raw instruction texts live in metadata too (runtime does not
+          // re-derive them from the edited text) — scrub the copies as well
+          const instructions = part.metadata?.experimental?.instructions
+          if (Array.isArray(instructions)) {
+            for (const ins of instructions) {
+              if (ins && typeof ins.text === "string") ins.text = scrub(ins.text)
+            }
+          }
         }
         for (const msg of event.messages) {
           const m = msg as { content?: unknown }
@@ -764,7 +782,9 @@ export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
             m.content = scrub(m.content)
           } else if (Array.isArray(m.content)) {
             for (const p of m.content) {
-              if (isRecord(p) && p.type === "text" && typeof p.text === "string") {
+              // any part carrying text: "text", "reasoning" (thinking replayed
+              // to the provider), tool parts with summaries, etc.
+              if (isRecord(p) && typeof p.text === "string") {
                 p.text = scrub(p.text)
               }
             }
