@@ -209,17 +209,9 @@ function uriToPath(uri: string): string | undefined {
   }
 }
 
-function trackHook(reg: Promise<{ dispose(): Promise<void> }>): void {
-  void reg.then(
-    (r) => tracked.push(r),
-    (err) => console.error("guard: hook registration failed", err),
-  )
-}
-
-const tracked: { dispose(): Promise<void> }[] = []
-
 /** recent deps-audit dedup: tool.before and shell.create.before both see the same command */
 const DEPS_AUDIT_TTL_MS = 2000
+// module-level on purpose: TTL-bounded audit noise filter, carries no per-location state
 const depsAuditRecent = new Map<string, number>()
 
 /**
@@ -244,6 +236,9 @@ interface RememberedValue {
   ts: number
 }
 const rememberedValues = new Map<string, RememberedValue[]>()
+// module-level on purpose: keyed by globally-unique session IDs (a session belongs
+// to exactly one location), and the wire scrub is safer when it sees more values;
+// per-location cleanup intentionally does NOT clear it
 
 function rememberValues(sessionID: string | undefined, matches: readonly { raw: string; category: string }[]): void {
   if (!sessionID || matches.length === 0) return
@@ -473,6 +468,22 @@ function schedulePostAudit(command: string, cwd: string, cfg: GuardConfig): void
 }
 
 export function registerGuard(ctx: Ctx, cfg: GuardConfig): () => Promise<void> {
+  // GUARD-13 (docs/npm-token-investigation.md, upstream anomalyco/opencode#66299):
+  // hook registrations must be PER INSTANCE. The plugin module is loaded once per
+  // server process, and every location runs setup against that same module — a
+  // module-level array here made any location's cleanup (e.g. idle eviction)
+  // dispose every other location's hooks: the evicted location's cleanup emptied
+  // the shared array via splice(0), the still-loaded locations never re-setup,
+  // and their prompt hooks died silently. dedupe maps below stay module-level on
+  // purpose: they are TTL-bounded noise filters and wire-scrub memory keyed by
+  // globally-unique session IDs, not per-location registrations.
+  const tracked: { dispose(): Promise<void> }[] = []
+  const trackHook = (reg: Promise<{ dispose(): Promise<void> }>): void => {
+    void reg.then(
+      (r) => tracked.push(r),
+      (err) => console.error("guard: hook registration failed", err),
+    )
+  }
   const patterns = activePatterns(cfg.disabledPatterns)
   const scanOpts = { piiEmailAllowDomains: cfg.piiEmailAllowDomains }
   const now = () => new Date().toISOString()
